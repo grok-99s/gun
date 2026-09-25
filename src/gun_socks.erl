@@ -23,8 +23,7 @@
 -export([handle/5]).
 -export([closing/4]).
 -export([close/4]).
-%% @todo down
-
+-export([down/1]).
 -record(socks_state, {
 	ref :: undefined | gun:stream_ref(),
 	reply_to :: gun:reply_to(),
@@ -107,21 +106,33 @@ switch_transport(Transport, Socket, State) ->
 handle(Data, State, CookieStore, _, EvHandlerState) ->
 	{handle(Data, State), CookieStore, EvHandlerState}.
 
-%% No authentication.
-handle(<<5, 0>>, State=#socks_state{version=5, status=auth_method_select}) ->
-	case send_socks5_connect(State) of
-		ok -> {state, State#socks_state{status=connect}};
-		Error={error, _} -> Error
+%% No authentication. Only proceed when it was offered. RFC1928
+%% does not let the server pick a method the client did not send,
+%% and accepting it would drop a required authentication method.
+handle(<<5, 0>>, State=#socks_state{opts=Opts, version=5, status=auth_method_select}) ->
+	case lists:member(none, maps:get(auth, Opts, [none])) of
+		true ->
+			case send_socks5_connect(State) of
+				ok -> {state, State#socks_state{status=connect}};
+				Error={error, _} -> Error
+			end;
+		false ->
+			{error, {socks5, {auth_method_not_offered, none}}}
 	end;
-%% Username/password authentication.
-handle(<<5, 2>>, State=#socks_state{socket=Socket, transport=Transport, opts=#{auth := AuthMethods},
+%% Username/password authentication. Same rule: do not assume an
+%% offered username entry, which badmatches when there is none.
+handle(<<5, 2>>, State=#socks_state{socket=Socket, transport=Transport, opts=Opts,
 		version=5, status=auth_method_select}) ->
-	[{username_password, Username, Password}] = [Method || Method <- AuthMethods],
-	ULen = byte_size(Username),
-	PLen = byte_size(Password),
-	case Transport:send(Socket, <<1, ULen, Username/binary, PLen, Password/binary>>) of
-		ok -> {state, State#socks_state{status=auth_username_password}};
-		Error={error, _} -> Error
+	case [Method || Method={username_password, _, _} <- maps:get(auth, Opts, [none])] of
+		[{username_password, Username, Password}] ->
+			ULen = byte_size(Username),
+			PLen = byte_size(Password),
+			case Transport:send(Socket, <<1, ULen, Username/binary, PLen, Password/binary>>) of
+				ok -> {state, State#socks_state{status=auth_username_password}};
+				Error={error, _} -> Error
+			end;
+		[] ->
+			{error, {socks5, {auth_method_not_offered, username_password}}}
 	end;
 %% Username/password authentication successful.
 handle(<<1, 0>>, State=#socks_state{version=5, status=auth_username_password}) ->
@@ -205,3 +216,9 @@ closing(_, _, _, EvHandlerState) ->
 
 close(_, _, _, EvHandlerState) ->
 	EvHandlerState.
+
+%% No tunnel stream exists until the handshake completes.
+down(#socks_state{ref=undefined}) ->
+	[];
+down(#socks_state{ref=Ref}) ->
+	[Ref].
