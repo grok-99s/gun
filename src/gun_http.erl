@@ -185,7 +185,9 @@ handle(Data, State=#http_state{in=body_chunked, in_state=InState, buffer=Buffer,
 		streams=[#stream{ref=StreamRef, reply_to=ReplyTo}|_], connection=Conn},
 		CookieStore, EvHandler, EvHandlerState0) ->
 	Buffer2 = << Buffer/binary, Data/binary >>,
-	case cow_http_te:stream_chunked(Buffer2, InState) of
+	%% A chunk-size line of 17 or more hex digits has no clause in
+	%% cow_http_te and would otherwise kill the connection.
+	try cow_http_te:stream_chunked(Buffer2, InState) of
 		more ->
 			{{state, State#http_state{buffer=Buffer2}}, CookieStore, EvHandlerState0};
 		{more, Data2, InState2} ->
@@ -248,6 +250,11 @@ handle(Data, State=#http_state{in=body_chunked, in_state=InState, buffer=Buffer,
 				{no_trailers, close} ->
 					{[{state, end_stream(State1)}, close], CookieStore, EvHandlerState}
 			end
+	catch _:_ ->
+		Reason = {connection_error, protocol_error,
+			"The chunked transfer-encoding body is invalid."},
+		gun:reply(ReplyTo, {gun_error, self(), Reason}),
+		{{error, Reason}, CookieStore, EvHandlerState0}
 	end;
 handle(Data, State=#http_state{opts=Opts, in=body_trailer,
 		buffer=Buffer, connection=Conn,
