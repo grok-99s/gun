@@ -18,6 +18,7 @@
 
 -import(ct_helper, [doc/1]).
 -import(ct_helper, [config/2]).
+-import(gun_test, [init_origin/3]).
 -import(gun_test, [receive_from/1]).
 
 all() ->
@@ -48,6 +49,186 @@ do_proto_opts() ->
 	}.
 
 %% Tests.
+
+setup_down_no_crash(_Config) ->
+	doc("A socket close while setup is in progress sends gun_down and "
+		"the Gun process retries. The same pid must be marked down, "
+		"then become setup again on the next gun_up."),
+	{ok, OriginPid, OriginPort} = init_origin(tcp, http, fun do_hold_then_close/4),
+	Scope = ?FUNCTION_NAME,
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", OriginPort, #{
+		conn_opts => #{
+			protocols => [http],
+			retry => 5,
+			retry_fun => fun(_, _) -> #{retries => 4, timeout => 800} end
+		},
+		scope => Scope,
+		size => 1,
+		setup_fun => {fun(_, _, SetupState) -> {setup, SetupState} end, undefined}
+	}),
+	handshake_completed = receive_from(OriginPid),
+	ConnPid = do_await_conn(ManagerPid, fun({setup, _}) -> true; (_) -> false end),
+	OriginPid ! {self(), close_it},
+	ok = do_await_pid(ManagerPid, ConnPid, down, 40),
+	ok = do_await_pid(ManagerPid, ConnPid, fun({setup, _}) -> true; (_) -> false end, 40),
+	OriginPid ! {self(), stop},
+	gun_pool:stop_pool("localhost", OriginPort, #{scope => Scope}).
+
+do_hold_then_close(Parent, ListenSocket, Socket, Transport) ->
+	receive {Parent, close_it} -> ok end,
+	Transport:close(Socket),
+	{ok, Socket2} = gen_tcp:accept(ListenSocket, 5000),
+	receive {Parent, stop} -> Transport:close(Socket2) end.
+
+setup_settings_no_crash(Config) ->
+	doc("SETTINGS received before setup completes must not crash the "
+		"pool, and SETTINGS after an HTTP/2 connection is up are kept."),
+	Port = config(port, Config),
+	Scope = ?FUNCTION_NAME,
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => Scope,
+		size => 1,
+		setup_fun => {fun
+			(_, {gun_up, _, _}, SetupState) ->
+				{setup, SetupState};
+			(_, {gun_upgrade, _, _, _, _}, _) ->
+				{up, http2, #{}};
+			(_, _, SetupState) ->
+				{setup, SetupState}
+		end, undefined}
+	}),
+	ConnPid = do_await_conn(ManagerPid, fun({setup, _}) -> true; (_) -> false end),
+	MRef = monitor(process, ManagerPid),
+	receive
+		{'DOWN', MRef, process, ManagerPid, Reason} ->
+			error({unexpected_crash, Reason})
+	after 500 ->
+		ok
+	end,
+	demonitor(MRef, [flush]),
+	{degraded, #{conns := #{ConnPid := {setup, _}}}} = gun_pool:info(ManagerPid),
+	%% SETTINGS arrived during setup. Completing setup must keep them.
+	ManagerPid ! {gun_upgrade, ConnPid, make_ref(), [<<"websocket">>], []},
+	ok = do_await_pid(ManagerPid, ConnPid, fun
+		({up, http2, Settings}) -> map_size(Settings) > 0;
+		(_) -> false
+	end, 20),
+	gun_pool:stop_pool("localhost", Port, #{scope => Scope}),
+	Scope2 = {?FUNCTION_NAME, up},
+	{ok, ManagerPid2} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => Scope2,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid2),
+	ok = do_await_h2_settings(ManagerPid2, 20),
+	gun_pool:stop_pool("localhost", Port, #{scope => Scope2}).
+
+stray_gun_upgrade_no_crash(Config) ->
+	doc("A gun_upgrade for a connection that is not in setup must not "
+		"crash the pool. A connection that is in setup still receives it."),
+	Port = config(port, Config),
+	Scope = ?FUNCTION_NAME,
+	Tid = ets:new(?FUNCTION_NAME, [public, set]),
+	ets:insert(Tid, {n, 0}),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => Scope,
+		size => 2,
+		setup_fun => {fun
+			(_ConnPid, {gun_up, _, _}, SetupState) ->
+				case ets:update_counter(Tid, n, 1) of
+					1 -> {up, http, #{}};
+					_ -> {setup, SetupState}
+				end;
+			(_, {gun_upgrade, _, _, _, _}, SetupState) ->
+				ets:insert(Tid, {upgrade, true}),
+				{setup, SetupState};
+			(_, _, SetupState) ->
+				{setup, SetupState}
+		end, undefined}
+	}),
+	UpPid = do_await_conn(ManagerPid, fun({up, http, _}) -> true; (_) -> false end),
+	SetupPid = do_await_conn(ManagerPid, fun({setup, _}) -> true; (_) -> false end),
+	MRef = monitor(process, ManagerPid),
+	ManagerPid ! {gun_upgrade, UpPid, make_ref(), [<<"websocket">>], []},
+	ManagerPid ! {gun_upgrade, make_ref(), make_ref(), [<<"websocket">>], []},
+	receive
+		{'DOWN', MRef, process, ManagerPid, Reason} ->
+			error({unexpected_crash, Reason})
+	after 500 ->
+		ok
+	end,
+	{degraded, #{conns := Conns}} = gun_pool:info(ManagerPid),
+	{up, http, _} = maps:get(UpPid, Conns),
+	{setup, _} = maps:get(SetupPid, Conns),
+	ManagerPid ! {gun_upgrade, SetupPid, make_ref(), [<<"websocket">>], []},
+	receive
+		{'DOWN', MRef, process, ManagerPid, Reason2} ->
+			error({unexpected_crash, Reason2})
+	after 200 ->
+		ok
+	end,
+	demonitor(MRef, [flush]),
+	{degraded, #{conns := Conns2}} = gun_pool:info(ManagerPid),
+	{setup, _} = maps:get(SetupPid, Conns2),
+	[{upgrade, true}] = ets:lookup(Tid, upgrade),
+	true = ets:delete(Tid),
+	gun_pool:stop_pool("localhost", Port, #{scope => Scope}).
+
+do_await_pid(ManagerPid, Pid, down, N) ->
+	do_await_pid(ManagerPid, Pid, fun(down) -> true; (_) -> false end, N);
+do_await_pid(ManagerPid, Pid, _Pred, 0) ->
+	error({pid_not_ready, Pid, gun_pool:info(ManagerPid)});
+do_await_pid(ManagerPid, Pid, Pred, N) ->
+	case gun_pool:info(ManagerPid) of
+		{_, #{conns := #{Pid := State}}} ->
+			case Pred(State) of
+				true -> ok;
+				false ->
+					timer:sleep(50),
+					do_await_pid(ManagerPid, Pid, Pred, N - 1)
+			end;
+		_ ->
+			timer:sleep(50),
+			do_await_pid(ManagerPid, Pid, Pred, N - 1)
+	end.
+
+do_await_conn(ManagerPid, Pred) ->
+	do_await_conn(ManagerPid, Pred, 50).
+
+do_await_conn(ManagerPid, Pred, 0) ->
+	error({conn_not_ready, gun_pool:info(ManagerPid), Pred});
+do_await_conn(ManagerPid, Pred, N) ->
+	case gun_pool:info(ManagerPid) of
+		{_, #{conns := Conns}} ->
+			case [Pid || {Pid, State} <- maps:to_list(Conns), Pred(State)] of
+				[Pid|_] -> Pid;
+				[] ->
+					timer:sleep(50),
+					do_await_conn(ManagerPid, Pred, N - 1)
+			end;
+		_ ->
+			timer:sleep(50),
+			do_await_conn(ManagerPid, Pred, N - 1)
+	end.
+
+do_await_h2_settings(ManagerPid, 0) ->
+	error({settings_not_stored, gun_pool:info(ManagerPid)});
+do_await_h2_settings(ManagerPid, N) ->
+	case gun_pool:info(ManagerPid) of
+		{operational, #{conns := Conns}} ->
+			case [S || {up, http2, S} <- maps:values(Conns), map_size(S) > 0] of
+				[_|_] -> ok;
+				[] ->
+					timer:sleep(50),
+					do_await_h2_settings(ManagerPid, N - 1)
+			end;
+		_ ->
+			timer:sleep(50),
+			do_await_h2_settings(ManagerPid, N - 1)
+	end.
 
 hello_pool_h1(Config) ->
 	doc("Confirm the pool can be used for HTTP/1.1 connections."),
